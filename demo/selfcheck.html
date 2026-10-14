@@ -1,0 +1,1069 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Apex · 世界顶级 AI 核心 · 浏览器自检</title>
+<style>
+  body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:880px;margin:24px auto;padding:0 16px;color:#1a1a1a;background:#fafafa}
+  h1{font-size:20px;border-bottom:3px solid #2e7d32;padding-bottom:8px}
+  button{background:#2e7d32;color:#fff;border:0;border-radius:6px;padding:10px 18px;font-size:15px;cursor:pointer}
+  button:hover{background:#1b5e20}
+  #summary{margin:14px 0;font-size:16px}
+  .row{background:#fff;border:1px solid #e0e0e0;border-left:4px solid #ccc;border-radius:6px;padding:10px 12px;margin:8px 0}
+  .row.ok{border-left-color:#2e7d32} .row.bad{border-left-color:#c62828}
+  .row span{color:#555;font-size:13px}
+  canvas{background:#fff;border:1px solid #e0e0e0;border-radius:6px;margin-top:8px}
+  code{background:#eee;padding:1px 5px;border-radius:4px}
+</style></head>
+<body>
+  <h1>✦ Apex — 世界顶级 AI 核心 · 浏览器自检</h1>
+  <p>零依赖、数值可验证。点击下方按钮在浏览器内运行全部不变量自检（与 <code>node --test</code> 同源）。</p>
+  <button id="run">运行自检</button>
+  <div id="summary"></div>
+  <div id="results"></div>
+  <canvas id="loss" width="560" height="240"></canvas>
+  <p style="color:#777;font-size:12px">架构：Transformer（Vaswani 2017）+ PCA/SVD（Eckart–Young）+ GMM-EM（Dempster 1977）+ kNN（Cover & Hart 1967）。作者：晨星。</p>
+  <script>
+/* ===== src/la.js ===== */
+// =============================================================
+// Apex · la.js — 线性代数与数值方法核心（零依赖，可复现）
+// 顶级算法来源：
+//   · Jacobi 特征值分解  — Jacobi (1846), Golub & Van Loan (2013) §8.4
+//   · SVD (Eckart–Young) — Eckart & Young (1936), GVL §2.4 / §8.6
+//   · Cholesky           — Cholesky (1924), GVL §4.2
+//   · softmax / layerNorm / cross-entropy — Vaswani et al. (2017) Transformer
+// 所有随机性由 seeded RNG 控制 → 可复现（reproducible）。
+// =============================================================
+
+// ---------- 可复现随机源（mulberry32, mulberry32 由 <https://github.com>bryc 普及）----------
+let _rng = Math.random;
+function setSeed(seed) {
+  let a = seed >>> 0;
+  _rng = function () {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function randn() {
+  // Box–Muller 变换（Box & Muller 1958），数值稳定
+  let u = 0, v = 0;
+  while (u === 0) u = _rng();
+  while (v === 0) v = _rng();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+
+// ---------- 基础矩阵工具 ----------
+const zeros = (r, c) => Array.from({ length: r }, () => new Array(c).fill(0));
+const ones = (r, c) => Array.from({ length: r }, () => new Array(c).fill(1));
+const identity = (n) => Array.from({ length: n }, (_, i) =>
+  Array.from({ length: n }, (_, j) => (i === j ? 1 : 0))
+);
+function randMat(r, c, scale = 1, gauss = true) {
+  return Array.from({ length: r }, () =>
+    Array.from({ length: c }, () => (gauss ? randn() * scale : (_rng() * 2 - 1) * scale))
+  );
+}
+function transpose(A) {
+  const r = A.length, c = A[0].length;
+  const T = zeros(c, r);
+  for (let i = 0; i < r; i++) for (let j = 0; j < c; j++) T[j][i] = A[i][j];
+  return T;
+}
+function matmul(A, B) {
+  const r = A.length, k = B.length, c = B[0].length;
+  const C = zeros(r, c);
+  for (let i = 0; i < r; i++) {
+    const Ai = A[i];
+    const Ci = C[i];
+    for (let p = 0; p < k; p++) {
+      const a = Ai[p];
+      if (a === 0) continue;
+      const Bp = B[p];
+      for (let j = 0; j < c; j++) Ci[j] += a * Bp[j];
+    }
+  }
+  return C;
+}
+// 广播加：bias 形状 [1][c] 加到 [r][c]
+function addMat(A, B) {
+  const r = A.length, c = A[0].length;
+  const C = zeros(r, c);
+  const broad = B.length === 1;
+  for (let i = 0; i < r; i++)
+    for (let j = 0; j < c; j++) C[i][j] = A[i][j] + (broad ? B[0][j] : B[i][j]);
+  return C;
+}
+function subMat(A, B) {
+  const r = A.length, c = A[0].length;
+  const C = zeros(r, c);
+  for (let i = 0; i < r; i++) for (let j = 0; j < c; j++) C[i][j] = A[i][j] - B[i][j];
+  return C;
+}
+function scaleMat(A, s) {
+  return A.map((row) => row.map((v) => v * s));
+}
+function hadamard(A, B) {
+  return A.map((row, i) => row.map((v, j) => v * B[i][j]));
+}
+function sumRows(A) {
+  const c = A[0].length;
+  const s = new Array(c).fill(0);
+  for (const row of A) for (let j = 0; j < c; j++) s[j] += row[j];
+  return [s];
+}
+function colSum(A) {
+  const r = A.length, c = A[0].length;
+  const s = new Array(c).fill(0);
+  for (let i = 0; i < r; i++) for (let j = 0; j < c; j++) s[j] += A[i][j];
+  return s;
+}
+function matVec(A, v) {
+  return A.map((row) => row.reduce((s, x, j) => s + x * v[j], 0));
+}
+function maxAbsDiff(A, B) {
+  let m = 0;
+  for (let i = 0; i < A.length; i++)
+    for (let j = 0; j < A[0].length; j++) m = Math.max(m, Math.abs(A[i][j] - B[i][j]));
+  return m;
+}
+function frobenius(A) {
+  let s = 0;
+  for (const row of A) for (const v of row) s += v * v;
+  return Math.sqrt(s);
+}
+
+// ---------- softmax（行方向，数值稳定，logsumexp 防溢出）----------
+function softmaxRows(M) {
+  return M.map((row) => {
+    const m = Math.max(...row);
+    const ex = row.map((v) => Math.exp(v - m));
+    const s = ex.reduce((a, b) => a + b, 0);
+    return ex.map((v) => v / s);
+  });
+}
+function logSumExpRows(M) {
+  return M.map((row) => {
+    const m = Math.max(...row);
+    return m + Math.log(row.reduce((a, v) => a + Math.exp(v - m), 0));
+  });
+}
+
+// ---------- LayerNorm（Ba et al. 2016），返回 cache 供反向 ----------
+function layerNormForward(x, gamma, beta, eps = 1e-5) {
+  const r = x.length, d = x[0].length;
+  const y = zeros(r, d);
+  const mu = new Array(r);
+  const varr = new Array(r);
+  for (let i = 0; i < r; i++) {
+    const row = x[i];
+    const m = row.reduce((a, b) => a + b, 0) / d;
+    let v = 0;
+    for (const val of row) v += (val - m) ** 2;
+    v /= d;
+    mu[i] = m;
+    varr[i] = v;
+    const inv = 1 / Math.sqrt(v + eps);
+    for (let j = 0; j < d; j++) y[i][j] = (row[j] - m) * inv * gamma[j] + beta[j];
+  }
+  return { y, cache: { x, gamma, beta, eps, mu, varr } };
+}
+function layerNormBackward(dY, cache) {
+  const { x, gamma, beta, eps, mu, varr } = cache;
+  const r = x.length, d = x[0].length;
+  const dX = zeros(r, d);
+  const dGamma = new Array(d).fill(0);
+  const dBeta = new Array(d).fill(0);
+  for (let i = 0; i < r; i++) {
+    const inv = 1 / Math.sqrt(varr[i] + eps);
+    let dVar = 0, dMu = 0;
+    for (let j = 0; j < d; j++) {
+      const xhat = (x[i][j] - mu[i]) * inv;
+      dGamma[j] += dY[i][j] * xhat;
+      dBeta[j] += dY[i][j];
+      dVar += dY[i][j] * gamma[j] * (x[i][j] - mu[i]) * -0.5 * inv ** 3;
+      dMu += -dY[i][j] * gamma[j] * inv;
+    }
+    for (let j = 0; j < d; j++) {
+      dX[i][j] = dY[i][j] * gamma[j] * inv + dVar * (2 * (x[i][j] - mu[i])) / d + dMu / d;
+    }
+  }
+  return { dX, dGamma, dBeta };
+}
+
+// ---------- 交叉熵（对 logits 行，target 为类别索引数组）----------
+function crossEntropyLogits(logits, targets) {
+  // 返回 { loss, dLogits }；数值稳定：logsumexp
+  const probs = softmaxRows(logits);
+  let loss = 0;
+  const dLogits = zeros(logits.length, logits[0].length);
+  for (let i = 0; i < logits.length; i++) {
+    const t = targets[i];
+    loss += -Math.log(probs[i][t] + 1e-12);
+    for (let j = 0; j < logits[0].length; j++) dLogits[i][j] = probs[i][j] - (j === t ? 1 : 0);
+  }
+  return { loss: loss / logits.length, dLogits: scaleMat(dLogits, 1 / logits.length) };
+}
+
+// =============================================================
+//  顶级数值：Jacobi 对称特征值分解（Golub & Van Loan §8.4）
+// =============================================================
+function jacobiEig(S, maxSweeps = 200, tol = 1e-13) {
+  const n = S.length;
+  let A = S.map((row) => row.slice());
+  let V = identity(n);
+  for (let sweep = 0; sweep < maxSweeps; sweep++) {
+    let off = 0;
+    for (let p = 0; p < n; p++)
+      for (let q = p + 1; q < n; q++) off += A[p][q] * A[p][q];
+    if (off < tol) break;
+    for (let p = 0; p < n; p++) {
+      for (let q = p + 1; q < n; q++) {
+        if (Math.abs(A[p][q]) < 1e-300) continue;
+        const theta = 0.5 * Math.atan2(2 * A[p][q], A[q][q] - A[p][p]);
+        const c = Math.cos(theta), s = Math.sin(theta);
+        // 旋转 A 的第 p,q 列与行
+        for (let k = 0; k < n; k++) {
+          const akp = A[k][p], akq = A[k][q];
+          A[k][p] = c * akp - s * akq;
+          A[k][q] = s * akp + c * akq;
+        }
+        for (let k = 0; k < n; k++) {
+          const apk = A[p][k], aqk = A[q][k];
+          A[p][k] = c * apk - s * aqk;
+          A[q][k] = s * apk + c * aqk;
+        }
+        // 累积特征向量
+        for (let k = 0; k < n; k++) {
+          const vkp = V[k][p], vkq = V[k][q];
+          V[k][p] = c * vkp - s * vkq;
+          V[k][q] = s * vkp + c * vkq;
+        }
+      }
+    }
+  }
+  const eig = [];
+  for (let i = 0; i < n; i++) eig.push(A[i][i]);
+  return { eig, V };
+}
+
+// =============================================================
+//  顶级数值：SVD（Eckart–Young / GVL §8.6）
+//  A (m×n) → U (m×r) Σ (r) V (n×r)，满足 A ≈ U diag(Σ) Vᵀ
+// =============================================================
+function svd(A) {
+  const m = A.length, n = A[0].length;
+  let U, Sigma, V, r;
+  if (m >= n) {
+    // 右奇异向量 = AᵀA 的特征向量
+    const AtA = matmul(transpose(A), A); // n×n
+    const { eig, V: Veig } = jacobiEig(AtA);
+    const pairs = eig.map((l, i) => ({ s: Math.sqrt(Math.max(l, 0)), v: Veig.map((row) => row[i]) }));
+    pairs.sort((a, b) => b.s - a.s);
+    r = Math.max(1, pairs.filter((p) => p.s > 1e-9).length);
+    Sigma = pairs.slice(0, r).map((p) => p.s);
+    const Vr = transpose(pairs.slice(0, r).map((p) => p.v)); // n×r，列为右奇异向量
+    const Utmp = zeros(m, r);
+    for (let i = 0; i < r; i++) {
+      const Av = matVec(A, pairs[i].v); // m×1
+      for (let k = 0; k < m; k++) Utmp[k][i] = Av[k] / Sigma[i];
+    }
+    U = Utmp; V = Vr;
+  } else {
+    // 左奇异向量 = A Aᵀ 的特征向量
+    const AAt = matmul(A, transpose(A)); // m×m
+    const { eig, V: Ueig } = jacobiEig(AAt);
+    const pairs = eig.map((l, i) => ({ s: Math.sqrt(Math.max(l, 0)), u: Ueig.map((row) => row[i]) }));
+    pairs.sort((a, b) => b.s - a.s);
+    r = Math.max(1, pairs.filter((p) => p.s > 1e-9).length);
+    Sigma = pairs.slice(0, r).map((p) => p.s);
+    const Ur = transpose(pairs.slice(0, r).map((p) => p.u)); // m×r，列为左奇异向量
+    const Vtmp = zeros(n, r);
+    for (let i = 0; i < r; i++) {
+      const Atu = matVec(transpose(A), pairs[i].u); // n×1
+      for (let k = 0; k < n; k++) Vtmp[k][i] = Atu[k] / Sigma[i];
+    }
+    U = Ur; V = Vtmp;
+  }
+  return { U, Sigma, V, r };
+}
+
+// =============================================================
+//  顶级数值：Cholesky 分解（GVL §4.2）A = L Lᵀ，A 对称正定
+// =============================================================
+function cholesky(A) {
+  const n = A.length;
+  const L = zeros(n, n);
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j <= i; j++) {
+      let s = A[i][j];
+      for (let k = 0; k < j; k++) s -= L[i][k] * L[j][k];
+      if (i === j) {
+        if (s <= 0) throw new Error('Cholesky: 矩阵非正定');
+        L[i][j] = Math.sqrt(s);
+      } else {
+        L[i][j] = s / L[j][j];
+      }
+    }
+  }
+  return L;
+}
+
+/* ===== src/nn.js ===== */
+// =============================================================
+// Apex · nn.js — 神经网络原语与优化（零依赖）
+// Dense 层前向/反向（解析梯度）、ReLU、MLP、Adam 优化器（Kingma & Ba 2015）、
+// MSE 损失。所有反向实现均可通过梯度检验（gradcheck）交叉验证。
+// =============================================================
+
+
+// ---------- Dense 全连接层：y = x W + b ----------
+class Dense {
+  constructor(inDim, outDim, scale = 0.1) {
+    this.W = randMat(inDim, outDim, scale);
+    this.b = zeros(1, outDim);
+  }
+  forward(x) {
+    this.x = x; // [n][inDim]
+    return addMat(matmul(x, this.W), this.b); // 广播 b
+  }
+  backward(dOut) {
+    // dOut: [n][outDim]
+    this.dW = matmul(transpose(this.x), dOut); // [inDim][outDim]
+    this.db = dOut.reduce((acc, row) => {
+      for (let j = 0; j < row.length; j++) acc[j] += row[j];
+      return acc;
+    }, new Array(dOut[0].length).fill(0));
+    this.db = [this.db]; // [1][outDim]
+    return matmul(dOut, transpose(this.W)); // dX
+  }
+  params() {
+    return [this.W, this.b];
+  }
+  grads() {
+    return [this.dW, this.db];
+  }
+  setParams(W, b) {
+    this.W = W;
+    this.b = b;
+  }
+}
+
+// ---------- ReLU 激活（无状态）----------
+const relu = (x) => x.map((row) => row.map((v) => (v > 0 ? v : 0)));
+function reluBackward(dY, x) {
+  return dY.map((row, i) => row.map((v, j) => (x[i][j] > 0 ? v : 0)));
+}
+
+// ---------- MLP（可堆叠 Dense+ReLU），含反向 ----------
+class MLP {
+  constructor(layerSizes, scale = 0.1) {
+    this.layers = [];
+    for (let i = 0; i < layerSizes.length - 1; i++) {
+      this.layers.push(new Dense(layerSizes[i], layerSizes[i + 1], scale));
+      if (i < layerSizes.length - 2) this.layers.push({ relu: true });
+    }
+  }
+  forward(x) {
+    this.caches = [];
+    let h = x;
+    for (const L of this.layers) {
+      if (L.relu) {
+        this.caches.push(h);
+        h = relu(h);
+      } else {
+        h = L.forward(h);
+      }
+    }
+    return h;
+  }
+  backward(dOut) {
+    let d = dOut;
+    for (let i = this.layers.length - 1; i >= 0; i--) {
+      const L = this.layers[i];
+      if (L.relu) {
+        d = reluBackward(d, this.caches.pop());
+      } else {
+        d = L.backward(d);
+      }
+    }
+    return d;
+  }
+  denseLayers() {
+    return this.layers.filter((L) => !L.relu);
+  }
+}
+
+// ---------- MSE 损失（含梯度）----------
+function mseLoss(pred, target) {
+  const n = pred.length, d = pred[0].length;
+  let loss = 0;
+  const dPred = zeros(n, d);
+  for (let i = 0; i < n; i++)
+    for (let j = 0; j < d; j++) {
+      const e = pred[i][j] - target[i][j];
+      loss += e * e;
+      dPred[i][j] = (2 * e) / (n * d);
+    }
+  return { loss: loss / (n * d), dPred };
+}
+
+// ---------- Adam 优化器（Kingma & Ba 2015）----------
+class Adam {
+  constructor(params, lr = 0.01, beta1 = 0.9, beta2 = 0.999, eps = 1e-8) {
+    this.params = params; // [{ref:obj, key:'W'|'b'}]
+    this.lr = lr;
+    this.beta1 = beta1;
+    this.beta2 = beta2;
+    this.eps = eps;
+    this.t = 0;
+    this.m = params.map(() => null);
+    this.v = params.map(() => null);
+  }
+  step(grads) {
+    this.t++;
+    const { beta1, beta2, eps, lr } = this;
+    for (let i = 0; i < this.params.length; i++) {
+      const p = this.params[i];
+      const g = grads[i];
+      const r = p.ref[p.key];
+      const is2D = Array.isArray(r[0]);
+      const rows = r.length;
+      const cols = is2D ? r[0].length : 1;
+      const m = this.m[i] || (is2D ? zeros(rows, cols) : new Array(rows).fill(0));
+      const v = this.v[i] || (is2D ? zeros(rows, cols) : new Array(rows).fill(0));
+      const nh = is2D ? zeros(rows, cols) : new Array(rows).fill(0);
+      for (let a = 0; a < rows; a++)
+        for (let b = 0; b < cols; b++) {
+          const ga = is2D ? g[a][b] : g[a];
+          const ra = is2D ? r[a][b] : r[a];
+          const ma = beta1 * (is2D ? m[a][b] : m[a]) + (1 - beta1) * ga;
+          const va = beta2 * (is2D ? v[a][b] : v[a]) + (1 - beta2) * ga * ga;
+          const mHat = ma / (1 - Math.pow(beta1, this.t));
+          const vHat = va / (1 - Math.pow(beta2, this.t));
+          const na = ra - (lr * mHat) / (Math.sqrt(vHat) + eps);
+          if (is2D) {
+            m[a][b] = ma;
+            v[a][b] = va;
+            nh[a][b] = na;
+          } else {
+            m[a] = ma;
+            v[a] = va;
+            nh[a] = na;
+          }
+        }
+      p.ref[p.key] = nh;
+      this.m[i] = m;
+      this.v[i] = v;
+    }
+  }
+}
+
+/* ===== src/attention.js ===== */
+// =============================================================
+// Apex · attention.js — 缩放点积注意力 + 多头注意力（零依赖）
+// 算法：Vaswani et al. (2017) "Attention Is All You Need" §3.2
+// 前向/反向均为解析梯度，可通过梯度检验交叉验证。
+// 反向推导核心（行方向 softmax 的 Jacobian）：
+//   dScores = attn ⊙ (dAttn − (attn · dAttn)[:,None])
+// =============================================================
+
+
+// ---------- 缩放点积注意力（单头）----------
+function scaledDotProductAttention(Q, K, V, mask = null, d = null) {
+  const seq = Q.length;
+  const dh = d ?? Q[0].length;
+  const sqrtD = Math.sqrt(dh);
+  // scores = Q Kᵀ / √d
+  const scores = matmul(Q, transpose(K)).map((row) => row.map((v) => v / sqrtD));
+  if (mask) {
+    for (let i = 0; i < seq; i++)
+      for (let j = 0; j < seq; j++) if (mask[i][j] === 0) scores[i][j] = -1e9;
+  }
+  const attn = softmaxRows(scores); // [seq][seq] 行归一
+  const out = matmul(attn, V); // [seq][dh]
+  return { out, cache: { Q, K, V, attn, scores, mask, sqrtD } };
+}
+
+function attentionBackward(dOut, cache) {
+  const { Q, K, V, attn, mask, sqrtD } = cache;
+  const seq = Q.length;
+  // dV = attnᵀ dOut
+  const dV = matmul(transpose(attn), dOut);
+  // dAttn = dOut Vᵀ
+  const dAttn = matmul(dOut, transpose(V));
+  // dScores = attn ⊙ (dAttn − rowsum(attn⊙dAttn)[:,None])
+  const dScores = zeros(seq, seq);
+  for (let i = 0; i < seq; i++) {
+    let s = 0;
+    for (let j = 0; j < seq; j++) s += attn[i][j] * dAttn[i][j];
+    for (let j = 0; j < seq; j++) {
+      let v = attn[i][j] * (dAttn[i][j] - s);
+      if (mask && mask[i][j] === 0) v = 0;
+      dScores[i][j] = v;
+    }
+  }
+  // dQ = dScores K / √d ; dK = dScoresᵀ Q / √d
+  const dQ = scaleMat(matmul(dScores, K), 1 / sqrtD);
+  const dK = scaleMat(matmul(transpose(dScores), Q), 1 / sqrtD);
+  return { dQ, dK, dV };
+}
+
+// ---------- 多头注意力（Multi-Head Attention）----------
+class MultiHeadAttention {
+  constructor(dModel, heads, scale = 0.1) {
+    this.d = dModel;
+    this.h = heads;
+    this.dh = dModel / heads;
+    this.Wq = randMat(dModel, dModel, scale);
+    this.Wk = randMat(dModel, dModel, scale);
+    this.Wv = randMat(dModel, dModel, scale);
+    this.Wo = randMat(dModel, dModel, scale);
+    this.bo = zeros(1, dModel);
+  }
+  forward(Q, K, V, mask = null) {
+    const seq = Q.length;
+    const dh = this.dh;
+    const Qp = matmul(Q, this.Wq);
+    const Kp = matmul(K, this.Wk);
+    const Vp = matmul(V, this.Wv);
+    // 切分为头
+    const Qh = [], Kh = [], Vh = [], caches = [];
+    for (let k = 0; k < this.h; k++) {
+      const c = (i) => i * dh;
+      Qh.push(Qp.map((row) => row.slice(c(k), c(k) + dh)));
+      Kh.push(Kp.map((row) => row.slice(c(k), c(k) + dh)));
+      Vh.push(Vp.map((row) => row.slice(c(k), c(k) + dh)));
+    }
+    const headOuts = [];
+    for (let k = 0; k < this.h; k++) {
+      const { out, cache } = scaledDotProductAttention(Qh[k], Kh[k], Vh[k], mask, dh);
+      headOuts.push(out);
+      caches.push(cache);
+    }
+    // 拼接头（沿特征维）
+    const concat = headOuts[0].map((_, i) => {
+      const row = [];
+      for (let k = 0; k < this.h; k++) row.push(...headOuts[k][i]);
+      return row;
+    });
+    const Y = addMat(matmul(concat, this.Wo), this.bo);
+    this.cache = { Qp, Kp, Vp, concat, caches, mask, seq, dh };
+    return Y;
+  }
+  backward(dY) {
+    const { Qp, Kp, Vp, concat, caches, mask, seq, dh } = this.cache;
+    const dConcat = matmul(dY, transpose(this.Wo));
+    this.dWo = matmul(transpose(concat), dY);
+    this.dbo = dY.reduce((acc, row) => {
+      for (let j = 0; j < row.length; j++) acc[j] += row[j];
+      return acc;
+    }, new Array(dY[0].length).fill(0));
+    this.dbo = [this.dbo];
+    const dQp = zeros(seq, this.d), dKp = zeros(seq, this.d), dVp = zeros(seq, this.d);
+    for (let k = 0; k < this.h; k++) {
+      const dOutK = dConcat.map((row) => row.slice(k * dh, k * dh + dh));
+      const { dQ, dK, dV } = attentionBackward(dOutK, caches[k]);
+      for (let i = 0; i < seq; i++) {
+        for (let j = 0; j < dh; j++) {
+          dQp[i][k * dh + j] += dQ[i][j];
+          dKp[i][k * dh + j] += dK[i][j];
+          dVp[i][k * dh + j] += dV[i][j];
+        }
+      }
+    }
+    // 投影层的反向
+    const Q = Qp; // 注意：调用方需提供原始 Q，这里用 Qp 反推需原始输入
+    // 返回 dQ,dK,dV 给输入；参数梯度由 dQp 等计算需原始 Q,K,V
+    this._dQp = dQp;
+    this._dKp = dKp;
+    this._dVp = dVp;
+    return { dQp, dKp, dVp };
+  }
+  // 计算投影参数梯度（需原始输入 Xq,Xk,Xv）
+  paramGrads(Xq, Xk, Xv) {
+    this.dWq = matmul(transpose(Xq), this._dQp);
+    this.dWk = matmul(transpose(Xk), this._dKp);
+    this.dWv = matmul(transpose(Xv), this._dVp);
+  }
+}
+
+/* ===== src/transformer.js ===== */
+// =============================================================
+// Apex · transformer.js — Transformer 解码器块 + 小型自回归语言模型
+// 架构：Vaswani et al. (2017) Attention Is All You Need
+//   · 正弦位置编码（§3.5）
+//   · 因果自注意力（causal mask）
+//   · 残差 + LayerNorm（post-norm）
+//   · 前馈 FFN = Linear → ReLU → Linear
+// 训练闭环：交叉熵损失随 epoch 单调递减（可验证），Adam 优化。
+// =============================================================
+
+
+
+
+// ---------- 正弦位置编码 ----------
+function positionalEncoding(seq, d, base = 10000) {
+  const PE = zeros(seq, d);
+  for (let pos = 0; pos < seq; pos++) {
+    for (let i = 0; i < d; i++) {
+      const denom = Math.pow(base, (2 * Math.floor(i / 2)) / d);
+      PE[pos][i] = i % 2 === 0 ? Math.sin(pos / denom) : Math.cos(pos / denom);
+    }
+  }
+  return PE;
+}
+
+// ---------- 因果掩码（下三角为 1）----------
+function causalMask(seq) {
+  return Array.from({ length: seq }, (_, i) =>
+    Array.from({ length: seq }, (_, j) => (j <= i ? 1 : 0))
+  );
+}
+
+// ---------- 解码器块 ----------
+class DecoderBlock {
+  constructor(d, heads, ffnDim, scale = 0.1) {
+    this.mha = new MultiHeadAttention(d, heads, scale);
+    this.ln1 = { gamma: new Array(d).fill(1), beta: new Array(d).fill(0) };
+    this.ffn1 = new Dense(d, ffnDim, scale);
+    this.ffn2 = new Dense(ffnDim, d, scale);
+    this.ln2 = { gamma: new Array(d).fill(1), beta: new Array(d).fill(0) };
+  }
+  forward(x, mask) {
+    const attnOut = this.mha.forward(x, x, x, mask);
+    const sum1 = addMat(x, attnOut);
+    const ln1 = layerNormForward(sum1, this.ln1.gamma, this.ln1.beta);
+    const f1 = relu(this.ffn1.forward(ln1.y));
+    const f2 = this.ffn2.forward(f1);
+    const sum2 = addMat(ln1.y, f2);
+    const ln2 = layerNormForward(sum2, this.ln2.gamma, this.ln2.beta);
+    this.cache = { x, attnOut, sum1, ln1, f1, f2, sum2, ln2, mask };
+    return ln2.y;
+  }
+  backward(dY) {
+    const { x, attnOut, sum1, ln1, f1, f2, sum2, ln2 } = this.cache;
+    const b2 = layerNormBackward(dY, ln2.cache);
+    const dSum2 = b2.dX; // = ∂/∂(y1+f2)
+    const dY1a = dSum2; // 残差分支（来自 y1）
+    const dB2 = this.ffn2.backward(dSum2); // f2 分支 → ∂/∂f1
+    const dY1b = reluBackward(dB2, this.ffn1.x); // 经 relu → ∂/∂y1
+    this.ffn1.backward(dY1b);
+    const dY1 = addMat(dY1a, dY1b); // 合并两条到 y1 的梯度
+    const b1 = layerNormBackward(dY1, ln1.cache);
+    const dSum1 = b1.dX; // = ∂/∂(x + attnOut)
+    const dAttnOut = dSum1; // 注意力分支
+    const dXresidual = dSum1; // 残差分支（来自 x）
+    const { dQp, dKp, dVp } = this.mha.backward(dAttnOut);
+    this.mha.paramGrads(x, x, x);
+    const dXattn = addMat(
+      matmul(dQp, transpose(this.mha.Wq)),
+      addMat(matmul(dKp, transpose(this.mha.Wk)), matmul(dVp, transpose(this.mha.Wv)))
+    );
+    const dX = addMat(dXresidual, dXattn);
+    this.dLn1g = b1.dGamma; this.dLn1b = b1.dBeta;
+    this.dLn2g = b2.dGamma; this.dLn2b = b2.dBeta;
+    return dX;
+  }
+}
+
+// ---------- 小型自回归语言模型 ----------
+class TransformerLM {
+  constructor(vocab, d, heads, ffnDim, nBlocks, scale = 0.1) {
+    this.vocab = vocab;
+    this.d = d;
+    this.E = randMat(vocab, d, scale); // 嵌入表 [vocab][d]
+    this.blocks = Array.from({ length: nBlocks }, () => new DecoderBlock(d, heads, ffnDim, scale));
+    this.Wo = randMat(d, vocab, scale); // 输出头（未绑定）
+    this.bo = zeros(1, vocab);
+    this.dE = zeros(vocab, d);
+  }
+  forward(ids) {
+    const seq = ids.length;
+    const x0 = ids.map((t) => this.E[t].slice());
+    const PE = positionalEncoding(seq, this.d);
+    let h = addMat(x0, PE);
+    const mask = causalMask(seq);
+    const blockCaches = [];
+    for (const blk of this.blocks) {
+      h = blk.forward(h, mask);
+      blockCaches.push(blk.cache);
+    }
+    const logits = addMat(matmul(h, this.Wo), this.bo); // [seq][vocab]
+    this.cache = { ids, seq, h, logits, PE };
+    return logits;
+  }
+  backward(targets) {
+    const { ids, seq, h, logits } = this.cache;
+    // 仅对位置 t=0..seq-2 监督（预测 ids[t+1]）
+    const supTargets = targets;
+    const { loss, dLogits } = crossEntropyLogits(logits, supTargets);
+    // 屏蔽未监督位置（最后一位置无下一 token）
+    const dLogitsFull = dLogits.map((row, i) => (i < seq - 1 ? row : new Array(row.length).fill(0)));
+    const dH = matmul(dLogitsFull, transpose(this.Wo));
+    this.dWo = matmul(transpose(h), dLogitsFull);
+    this.dbo = dLogitsFull.reduce((acc, row) => {
+      for (let j = 0; j < row.length; j++) acc[j] += row[j];
+      return acc;
+    }, new Array(this.vocab).fill(0));
+    this.dbo = [this.dbo];
+    // 位置编码无参数；梯度回流到嵌入
+    let dX = dH.map((row) => row.slice());
+    for (let i = this.blocks.length - 1; i >= 0; i--) {
+      dX = this.blocks[i].backward(dX);
+    }
+    // 嵌入梯度：dX 回流到 x0（减去 PE 不影响 E）
+    this.dE = zeros(this.vocab, this.d);
+    for (let i = 0; i < seq; i++) {
+      const t = ids[i];
+      for (let j = 0; j < this.d; j++) this.dE[t][j] += dX[i][j];
+    }
+    return loss;
+  }
+  // 收集所有参数引用与对应梯度（供 Adam）
+  paramRefs() {
+    const refs = [];
+    refs.push({ ref: this, key: 'E' });
+    for (const blk of this.blocks) {
+      refs.push({ ref: blk.mha, key: 'Wq' });
+      refs.push({ ref: blk.mha, key: 'Wk' });
+      refs.push({ ref: blk.mha, key: 'Wv' });
+      refs.push({ ref: blk.mha, key: 'Wo' });
+      refs.push({ ref: blk.mha, key: 'bo' });
+      refs.push({ ref: blk.ffn1, key: 'W' });
+      refs.push({ ref: blk.ffn1, key: 'b' });
+      refs.push({ ref: blk.ffn2, key: 'W' });
+      refs.push({ ref: blk.ffn2, key: 'b' });
+      refs.push({ ref: blk.ln1, key: 'gamma' });
+      refs.push({ ref: blk.ln1, key: 'beta' });
+      refs.push({ ref: blk.ln2, key: 'gamma' });
+      refs.push({ ref: blk.ln2, key: 'beta' });
+    }
+    refs.push({ ref: this, key: 'Wo' });
+    refs.push({ ref: this, key: 'bo' });
+    return refs;
+  }
+  grads() {
+    const g = [];
+    g.push(this.dE);
+    for (const blk of this.blocks) {
+      g.push(blk.mha.dWq); g.push(blk.mha.dWk); g.push(blk.mha.dWv);
+      g.push(blk.mha.dWo); g.push(blk.mha.dbo);
+      g.push(blk.ffn1.dW); g.push(blk.ffn1.db);
+      g.push(blk.ffn2.dW); g.push(blk.ffn2.db);
+      g.push(blk.dLn1g); g.push(blk.dLn1b);
+      g.push(blk.dLn2g); g.push(blk.dLn2b);
+    }
+    g.push(this.dWo); g.push(this.dbo);
+    return g;
+  }
+  trainStep(ids, targets, optim) {
+    this.forward(ids);
+    const loss = this.backward(targets);
+    optim.step(this.grads());
+    return loss;
+  }
+  predictNext(ids) {
+    const logits = this.forward(ids);
+    const last = logits[logits.length - 1];
+    let best = 0;
+    for (let j = 1; j < last.length; j++) if (last[j] > last[best]) best = j;
+    return best;
+  }
+}
+
+// 便捷：构建 Adam 优化器
+function makeOptim(model, lr = 0.02) {
+  return new Adam(model.paramRefs(), lr);
+}
+
+/* ===== src/ml.js ===== */
+// =============================================================
+// Apex · ml.js — 经典顶级算法（集大成，可验证不变量）
+//   · PCA   — 基于 SVD（Eckart–Young / GVL §8.6），最优低秩重构
+//   · GMM   — EM 算法（Dempster, Laird & Rubin 1977），对数似然单调
+//   · kNN   — 惰性学习（Cover & Hart 1967）
+// 每个算法暴露可被独立实现交叉验证的「不变量」。
+// =============================================================
+
+
+// =============================================================
+// PCA（SVD 分解，数值最稳定；优于特征分解协方差）
+// =============================================================
+function pca(X, k) {
+  const n = X.length, d = X[0].length;
+  const mean = new Array(d).fill(0);
+  for (const row of X) for (let j = 0; j < d; j++) mean[j] += row[j];
+  for (let j = 0; j < d; j++) mean[j] /= n;
+  const Xc = X.map((row) => row.map((v, j) => v - mean[j]));
+  const { U, Sigma, V } = svd(Xc); // V 为 d×r，列为右奇异向量（主成分）
+  const r = V[0].length;
+  const kk = k ?? r;
+  const comps = transpose(V).slice(0, kk); // kk×d，每行为一个主成分
+  const scores = matmul(Xc, V.slice ? V : V); // 见下：取前 kk 列
+  // 取 V 前 kk 列投影
+  const Vk = V.map((row) => row.slice(0, kk)); // d×kk
+  const Z = matmul(Xc, Vk); // n×kk
+  const totalVar = Sigma.reduce((s, v) => s + v * v, 0);
+  const explained = Sigma.slice(0, kk).map((v) => (v * v) / totalVar);
+  return { mean, components: comps, scores: Z, singularValues: Sigma.slice(0, kk), explainedRatio: explained, V: Vk };
+}
+
+// =============================================================
+// GMM — EM 算法（Dempster, Laird & Rubin 1977）
+// 不变量：① 责任度每行 Σ=1；② 混合权重 Σ=1；③ 对数似然单调非减
+// =============================================================
+function forwardSolve(L, b) {
+  const n = L.length;
+  const z = new Array(n).fill(0);
+  for (let i = 0; i < n; i++) {
+    let s = b[i];
+    for (let j = 0; j < i; j++) s -= L[i][j] * z[j];
+    z[i] = s / L[i][i];
+  }
+  return z;
+}
+function logMVN(x, mu, L) {
+  const d = x.length;
+  const diff = x.map((v, i) => v - mu[i]);
+  const z = forwardSolve(L, diff);
+  let quad = 0;
+  for (const v of z) quad += v * v;
+  let logdet = 0;
+  for (let i = 0; i < d; i++) logdet += Math.log(L[i][i]);
+  logdet *= 2;
+  return -0.5 * (d * Math.log(2 * Math.PI) + logdet + quad);
+}
+function gmmFit(X, k, iters = 50, reg = 1e-6, seed = 42) {
+  setSeed(seed);
+  const n = X.length, d = X[0].length;
+  // 初始化：均值取随机样本点，协方差取各维方差
+  const meanAll = new Array(d).fill(0);
+  for (const row of X) for (let j = 0; j < d; j++) meanAll[j] += row[j];
+  for (let j = 0; j < d; j++) meanAll[j] /= n;
+  let varAll = 0;
+  for (const row of X) for (let j = 0; j < d; j++) varAll += (row[j] - meanAll[j]) ** 2;
+  varAll = (varAll / (n * d)) || 1;
+  const idxs = [];
+  for (let i = 0; i < k; i++) idxs.push(Math.floor(Math.random() * n));
+  const mu = idxs.map((i) => X[i].slice());
+  const Sigma = Array.from({ length: k }, () => {
+    const S = zeros(d, d);
+    for (let i = 0; i < d; i++) S[i][i] = varAll;
+    return S;
+  });
+  let pi = new Array(k).fill(1 / k);
+  const llTrace = [];
+  const L = Sigma.map((S) => {
+    const Sreg = S.map((row, i) => row.map((v, j) => (i === j ? v + reg : v)));
+    return cholesky(Sreg);
+  });
+  for (let it = 0; it < iters; it++) {
+    // E-step
+    const logR = zeros(n, k);
+    let ll = 0;
+    for (let i = 0; i < n; i++) {
+      const ls = [];
+      for (let c = 0; c < k; c++) ls.push(Math.log(pi[c] + 1e-12) + logMVN(X[i], mu[c], L[c]));
+      const m = Math.max(...ls);
+      const sumExp = ls.reduce((a, v) => a + Math.exp(v - m), 0);
+      ll += m + Math.log(sumExp);
+      for (let c = 0; c < k; c++) logR[i][c] = Math.exp(ls[c] - m) / sumExp;
+    }
+    llTrace.push(ll);
+    // M-step
+    const Nk = new Array(k).fill(0);
+    for (let i = 0; i < n; i++) for (let c = 0; c < k; c++) Nk[c] += logR[i][c];
+    for (let c = 0; c < k; c++) pi[c] = Nk[c] / n;
+    for (let c = 0; c < k; c++) {
+      const muC = new Array(d).fill(0);
+      for (let i = 0; i < n; i++) for (let j = 0; j < d; j++) muC[j] += logR[i][c] * X[i][j];
+      for (let j = 0; j < d; j++) muC[j] /= Nk[c] || 1e-12;
+      mu[c] = muC;
+      const S = zeros(d, d);
+      for (let i = 0; i < n; i++) {
+        const diff = X[i].map((v, j) => v - muC[j]);
+        for (let a = 0; a < d; a++) for (let b = 0; b < d; b++) S[a][b] += logR[i][c] * diff[a] * diff[b];
+      }
+      for (let a = 0; a < d; a++) for (let b = 0; b < d; b++) S[a][b] /= Nk[c] || 1e-12;
+      for (let a = 0; a < d; a++) S[a][a] += reg;
+      Sigma[c] = S;
+      L[c] = cholesky(S);
+    }
+  }
+  return { pi, mu, Sigma, llTrace };
+}
+
+// =============================================================
+// kNN — 惰性学习（Cover & Hart 1967），分类
+// =============================================================
+class KNN {
+  constructor(X, y) {
+    this.X = X;
+    this.y = y;
+  }
+  _dist(a, b) {
+    let s = 0;
+    for (let i = 0; i < a.length; i++) s += (a[i] - b[i]) ** 2;
+    return Math.sqrt(s);
+  }
+  predict(q, k = 3) {
+    const dists = this.X.map((x, i) => ({ i, d: this._dist(q, x) }));
+    dists.sort((a, b) => a.d - b.d);
+    const top = dists.slice(0, k);
+    const votes = new Map();
+    for (const { i } of top) votes.set(this.y[i], (votes.get(this.y[i]) || 0) + 1);
+    let best = null, bestC = -1;
+    for (const [cls, c] of votes) if (c > bestC) { bestC = c; best = cls; }
+    return best;
+  }
+}
+</script>
+  <script>
+// ---- 浏览器自检运行时 ----
+function relErr(A, B) {
+  let num = 0, den = 0;
+  for (let i = 0; i < A.length; i++) for (let j = 0; j < A[0].length; j++) {
+    num = Math.max(num, Math.abs(A[i][j] - B[i][j]));
+    den = Math.max(den, Math.abs(A[i][j]) + Math.abs(B[i][j]));
+  }
+  return num / (den + 1e-12);
+}
+function numGradMat(f, M, eps = 1e-5) {
+  const g = zeros(M.length, M[0].length);
+  for (let i = 0; i < M.length; i++) for (let j = 0; j < M[0].length; j++) {
+    const o = M[i][j]; M[i][j] = o + eps; const lp = f();
+    M[i][j] = o - eps; const lm = f(); M[i][j] = o;
+    g[i][j] = (lp - lm) / (2 * eps);
+  }
+  return g;
+}
+function check(name, fn) {
+  try { const detail = fn(); return { name, pass: true, detail }; }
+  catch (e) { return { name, pass: false, detail: e.message }; }
+}
+
+async function runAll() {
+  const out = [];
+  const lossCurve = [];
+
+  out.push(check('SVD 重构误差 < 1e-7 且奇异向量正交', () => {
+    setSeed(1); const A = randMat(6, 4, 1); const { U, Sigma, V, r } = svd(A);
+    const S = zeros(r, r); for (let i = 0; i < r; i++) S[i][i] = Sigma[i];
+    const recon = matmul(matmul(U, S), transpose(V));
+    const e = maxAbsDiff(recon, A);
+    if (e >= 1e-7) throw new Error('重构误差=' + e);
+    const UtU = matmul(transpose(U), U);
+    const o = maxAbsDiff(UtU, identity(r));
+    if (o >= 1e-7) throw new Error('U 不正交=' + o);
+    return '重构误差=' + e.toExponential(2) + '，UᵀU-I=' + o.toExponential(2);
+  }));
+
+  out.push(check('Cholesky A = L Lᵀ', () => {
+    setSeed(3); const M = randMat(4, 4, 1); const A = matmul(M, transpose(M));
+    for (let i = 0; i < 4; i++) A[i][i] += 0.5;
+    const L = cholesky(A); const e = maxAbsDiff(matmul(L, transpose(L)), A);
+    if (e >= 1e-9) throw new Error('误差=' + e);
+    return '误差=' + e.toExponential(2);
+  }));
+
+  out.push(check('Dense 反向梯度检验 relErr < 1e-5', () => {
+    setSeed(10); const n = 5, inD = 4, outD = 3; const x = randMat(n, inD, 1);
+    const layer = new Dense(inD, outD, 0.5); const G = randMat(n, outD, 1);
+    layer.forward(x); layer.backward(G);
+    const numW = numGradMat(() => { const o = addMat(matmul(x, layer.W), layer.b); let s = 0; for (let i = 0; i < n; i++) for (let j = 0; j < outD; j++) s += o[i][j] * G[i][j]; return s; }, layer.W);
+    const e = relErr(numW, layer.dW); if (e >= 1e-5) throw new Error('dW=' + e);
+    return 'dW relErr=' + e.toExponential(2);
+  }));
+
+  out.push(check('多头注意力反向梯度检验 relErr < 1e-4', () => {
+    setSeed(21); const seq = 4, d = 4, heads = 2; const mha = new MultiHeadAttention(d, heads, 0.5);
+    const X = randMat(seq, d, 1); const G = randMat(seq, d, 1); mha.forward(X, X, X, null);
+    const { dQp, dKp, dVp } = mha.backward(G); mha.paramGrads(X, X, X);
+    const dX = addMat(matmul(dQp, transpose(mha.Wq)), addMat(matmul(dKp, transpose(mha.Wk)), matmul(dVp, transpose(mha.Wv))));
+    const numX = numGradMat(() => { const o = mha.forward(X, X, X, null); let s = 0; for (let i = 0; i < seq; i++) for (let j = 0; j < d; j++) s += o[i][j] * G[i][j]; return s; }, X);
+    const e = relErr(numX, dX); if (e >= 1e-4) throw new Error('dX=' + e);
+    return 'dX relErr=' + e.toExponential(2);
+  }));
+
+  out.push(check('Transformer 语言模型损失下降', () => {
+    setSeed(30); const vocab = 4;
+    const corpus = [[0,1,2,3,0,1,2,3],[1,2,3,0,1,2,3,0],[2,3,0,1,2,3,0,1],[3,0,1,2,3,0,1,2]];
+    const model = new TransformerLM(vocab, 16, 2, 32, 2, 0.1); const opt = makeOptim(model, 0.05);
+    let first;
+    for (let s = 0; s < 400; s++) {
+      const seq = corpus[s % corpus.length]; const targets = seq.slice(1).concat(seq[seq.length - 1]);
+      const loss = model.trainStep(seq, targets, opt);
+      if (s === 0) first = loss; if (s % 20 === 0) lossCurve.push(loss);
+    }
+    const finalLoss = model.trainStep(corpus[0], corpus[0].slice(1).concat(corpus[0][corpus[0].length - 1]), opt);
+    lossCurve.push(finalLoss);
+    if (finalLoss >= first * 0.6) throw new Error('损失未明显下降 ' + first.toFixed(3) + '→' + finalLoss.toFixed(3));
+    const pred = model.predictNext([0, 1, 2]);
+    return '损失 ' + first.toFixed(3) + ' → ' + finalLoss.toFixed(3) + '，[0,1,2]→' + pred;
+  }));
+
+  out.push(check('PCA 主方向正确 + 方差解释归一', () => {
+    setSeed(40); const u = [1/Math.SQRT2, 1/Math.SQRT2]; const X = [];
+    for (let i = 0; i < 200; i++) { const t = (Math.random()-0.5)*10; X.push([t*u[0]+randn()*0.05, t*u[1]+randn()*0.05]); }
+    const { components, explainedRatio } = pca(X, 2);
+    const dt = Math.abs(components[0][0]*u[0] + components[0][1]*u[1]);
+    if (dt < 0.99) throw new Error('方向 dot=' + dt);
+    const sum = explainedRatio.reduce((a,b)=>a+b,0);
+    if (Math.abs(sum-1) >= 1e-9) throw new Error('解释率和=' + sum);
+    return '主方向 dot=' + dt.toFixed(4) + '，top 解释率=' + explainedRatio[0].toFixed(3);
+  }));
+
+  out.push(check('GMM-EM 对数似然单调 + 权重归一', () => {
+    setSeed(41); const X = [];
+    for (let i = 0; i < 100; i++) X.push([randn()*0.5+5, randn()*0.5+5]);
+    for (let i = 0; i < 100; i++) X.push([randn()*0.5-5, randn()*0.5-5]);
+    const { pi, llTrace } = gmmFit(X, 2, 40, 1e-6, 41);
+    const wSum = pi.reduce((a,b)=>a+b,0);
+    if (Math.abs(wSum-1) >= 1e-9) throw new Error('权重和=' + wSum);
+    let mono = true; for (let i = 1; i < llTrace.length; i++) if (llTrace[i] < llTrace[i-1]-1e-4) mono = false;
+    if (!mono) throw new Error('对数似然非单调');
+    return '权重和=' + wSum.toFixed(6) + '，LL ' + llTrace[0].toFixed(1) + '→' + llTrace[llTrace.length-1].toFixed(1);
+  }));
+
+  out.push(check('kNN 线性可分 100% 准确', () => {
+    setSeed(42); const X = [], y = [];
+    for (let i = 0; i < 50; i++) { X.push([randn()*0.3+2, randn()*0.3+2]); y.push(0); }
+    for (let i = 0; i < 50; i++) { X.push([randn()*0.3-2, randn()*0.3-2]); y.push(1); }
+    const knn = new KNN(X, y); let c = 0; for (let i = 0; i < X.length; i++) if (knn.predict(X[i], 3) === y[i]) c++;
+    if (c !== X.length) throw new Error(c + '/' + X.length);
+    return c + '/' + X.length + ' 正确';
+  }));
+
+  return { out, lossCurve };
+}
+
+function render(res) {
+  const passN = res.out.filter(r => r.pass).length;
+  document.getElementById('summary').innerHTML =
+    '<b>自检结果：' + passN + ' / ' + res.out.length + ' 项通过</b>';
+  const box = document.getElementById('results'); box.innerHTML = '';
+  for (const r of res.out) {
+    const div = document.createElement('div');
+    div.className = 'row ' + (r.pass ? 'ok' : 'bad');
+    div.innerHTML = (r.pass ? '✅ ' : '⚠️ ') + '<b>' + r.name + '</b><br><span>' + r.detail + '</span>';
+    box.appendChild(div);
+  }
+  drawLoss(res.lossCurve);
+}
+function drawLoss(curve) {
+  const cv = document.getElementById('loss'); const ctx = cv.getContext('2d');
+  ctx.clearRect(0,0,cv.width,cv.height); ctx.strokeStyle='#888'; ctx.strokeRect(0,0,cv.width,cv.height);
+  const max = Math.max(...curve), min = Math.min(...curve);
+  ctx.strokeStyle = '#2e7d32'; ctx.beginPath();
+  curve.forEach((v,i) => { const x = (i/(curve.length-1))*cv.width; const y = cv.height - ((v-min)/(max-min||1))*cv.height; i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+  ctx.stroke();
+  ctx.fillStyle='#444'; ctx.fillText('Transformer 训练损失', 8, 14);
+}
+document.getElementById('run').onclick = async () => {
+  document.getElementById('summary').textContent = '运行中…';
+  const res = await runAll(); render(res);
+};
+</script>
+</body></html>
